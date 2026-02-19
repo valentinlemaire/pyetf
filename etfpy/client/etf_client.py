@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import bs4
+import requests
 
 from etfpy.client._base_client import BaseClient
 from etfpy.exc import InvalidETFException
@@ -15,6 +16,7 @@ from etfpy.utils import (
     _handle_nth_child,
     _handle_spans,
     chunkify,
+    get_headers,
     handle_find_all_rows,
     handle_tbody_thead,
 )
@@ -79,10 +81,84 @@ class ETFDBClient(BaseClient):
         BeautifulSoup object ready to parse with bs4 library
         """
         url = self._prepare_url()
-        response = self._session.get(url)
+        debug_path = getattr(self, "debug_html_path", None)
+        text = self._fetch_html(url, debug_path=debug_path)
+        return bs4.BeautifulSoup(text, "html.parser")
+
+    def _fetch_html(self, url: str, debug_path: str = None) -> str:
+        # Refresh headers to avoid stale or blocked user agents.
+        self._session.headers.update(get_headers())
+        # Prime session with homepage to pick up cookies and reduce bot blocks.
+        try:
+            self._session.get(self._base_url, allow_redirects=True)
+        except Exception as exc:
+            logger.debug("failed to prefetch homepage: %s", exc)
+
+        response = self._session.get(url, allow_redirects=True)
         if response.status_code != 200:
             raise Exception(f"response {response.status_code}: {response.reason}")
-        return bs4.BeautifulSoup(response.text, "html.parser")
+        content = response.content or b""
+        text = response.text or ""
+        if "<html" not in text.lower():
+            # Try a safer decode if requests didn't decode correctly.
+            encoding = response.apparent_encoding or "utf-8"
+            try:
+                text = content.decode(encoding, errors="replace")
+            except Exception:
+                text = content.decode("utf-8", errors="replace")
+        if debug_path:
+            try:
+                path = Path(debug_path)
+                if "<html" in text.lower():
+                    path.write_text(text, encoding="utf-8")
+                else:
+                    # Save raw content for inspection if we couldn't decode HTML.
+                    path.write_bytes(content)
+            except Exception as exc:
+                logger.warning("failed to write debug html: %s", exc)
+        # Detect common bot-protection / challenge pages.
+        block_markers = [
+            "Access Denied",
+            "Pardon Our Interruption",
+            "verify you are human",
+            "captcha",
+            "cloudflare",
+            "distil",
+        ]
+        is_blocked = any(marker.lower() in text.lower() for marker in block_markers)
+        if is_blocked:
+            # Try Cloudflare-aware scraper if available.
+            text = self._try_cloudscraper(url, debug_path=debug_path)
+            if text:
+                return text
+            raise Exception(
+                "ETFDB returned a bot-protection page. "
+                "Install cloudscraper or use a browser-like session."
+            )
+        return text
+
+    def _try_cloudscraper(self, url: str, debug_path: str = None) -> str:
+        try:
+            import cloudscraper  # type: ignore
+        except Exception:
+            return ""
+
+        try:
+            scraper = cloudscraper.create_scraper()
+            scraper.headers.update(get_headers())
+            resp = scraper.get(url, allow_redirects=True, timeout=30)
+            if resp.status_code != 200:
+                return ""
+            text = resp.text or ""
+            if debug_path:
+                try:
+                    Path(debug_path).write_text(text, encoding="utf-8")
+                except Exception as exc:
+                    logger.warning("failed to write debug html: %s", exc)
+            return text
+        except requests.RequestException as exc:
+            logger.warning("cloudscraper request failed: %s", exc)
+            return ""
 
     def _profile_container(self) -> dict:
         """Parses the profile container into a dictionary.
@@ -91,6 +167,9 @@ class ETFDBClient(BaseClient):
             A dictionary containing the profile information.
         """
         profile_container = self._soup.find("div", {"class": "profile-container"})
+        if not profile_container:
+            logger.warning("profile container not found for %s", self.ticker)
+            return {}
         results: List[Tuple] = []
         for row in profile_container.find_all("div", class_="row"):
             spans = row.find_all("span")
@@ -112,9 +191,13 @@ class ETFDBClient(BaseClient):
                    'Shares': '0.4 M'
                }
         """
-        trading_data = self._soup.find(
+        trading_container = self._soup.find(
             "div", {"class": "data-trading bar-charts-table"}
-        ).find_all("li")
+        )
+        if not trading_container:
+            logger.warning("trading data container not found for %s", self.ticker)
+            return {}
+        trading_data = trading_container.find_all("li")
         trading_dict = {
             _handle_nth_child(li, 1): _handle_nth_child(li, 2) for li in trading_data
         }
@@ -123,9 +206,13 @@ class ETFDBClient(BaseClient):
     def _asset_categories(self) -> dict:
         """Get asset categories data"""
 
-        theme = self._soup.find("div", {"id": "etf-ticker-body"}).find_all(
-            "div", class_="ticker-assets"
-        )
+        ticker_body = self._soup.find("div", {"id": "etf-ticker-body"})
+        if not ticker_body:
+            ticker_body = self._soup.find("div", id=re.compile("etf-ticker", re.I))
+        if not ticker_body:
+            logger.warning("asset categories not found for %s", self.ticker)
+            return {}
+        theme = ticker_body.find_all("div", class_="ticker-assets")
         if not theme or len(theme) < 1:
             return {}
         theme_dict = handle_find_all_rows(theme[1].find_all("div", class_="row"))
@@ -133,9 +220,11 @@ class ETFDBClient(BaseClient):
 
     def _factset_classification(self) -> dict:
         """Get factset information"""
-        factset = self._soup.find("div", {"id": "factset-classification"}).find_all(
-            "tr"
-        )
+        factset_container = self._soup.find("div", {"id": "factset-classification"})
+        if not factset_container:
+            logger.warning("factset classification not found for %s", self.ticker)
+            return {}
+        factset = factset_container.find_all("tr")
         factset_dict = handle_find_all_rows(factset)
         return factset_dict
 
@@ -149,11 +238,20 @@ class ETFDBClient(BaseClient):
 
     def _valuation(self) -> dict:
         """Get ETF valuation metrics."""
-        valuation = (
-            self._soup.find("div", {"id": "etf-ticker-valuation-dividend_tab"})
-            .find("div", {"id": "valuation"})
-            .find_all("div", class_="row")
+        valuation_container = self._soup.find(
+            "div", {"id": "etf-ticker-valuation-dividend_tab"}
         )
+        if not valuation_container:
+            logger.warning("valuation container not found for %s", self.ticker)
+            return {}
+        valuation_section = valuation_container.find("div", {"id": "valuation"})
+        if not valuation_section:
+            logger.warning("valuation section not found for %s", self.ticker)
+            return {}
+        valuation = valuation_section.find_all("div", class_="row")
+        if not valuation or len(valuation) < 2:
+            logger.warning("valuation rows missing for %s", self.ticker)
+            return {}
         names = [
             [
                 i.text.strip()
@@ -217,10 +315,12 @@ class ETFDBClient(BaseClient):
 
     def _technicals(self) -> Dict:
         """Get technical analysis indicators for etf."""
+        technicals_container = self._soup.find("div", {"id": "technicals-collapse"})
+        if not technicals_container:
+            logger.warning("technicals container not found for %s", self.ticker)
+            return {}
         sections = list(
-            self._soup.find("div", {"id": "technicals-collapse"}).find_all(
-                "ul", class_="list-unstyled"
-            )
+            technicals_container.find_all("ul", class_="list-unstyled")
         )
 
         results = []
@@ -233,9 +333,13 @@ class ETFDBClient(BaseClient):
 
     def _volatility(self) -> Dict:
         """Get Volatility  information."""
+        technicals_container = self._soup.find("div", {"id": "technicals-collapse"})
+        if not technicals_container:
+            logger.warning("volatility container not found for %s", self.ticker)
+            return {}
         metrics = [
             x.text.strip().split("\n\n\n\n")
-            for x in self._soup.find("div", {"id": "technicals-collapse"}).find_all(
+            for x in technicals_container.find_all(
                 "div", class_=re.compile("row relative-metric")
             )
         ]
@@ -255,35 +359,214 @@ class ETFDBClient(BaseClient):
 
         return dict(zip(chart_titles, parse_data))
 
+    def _prepare_esg_urls(self) -> List[str]:
+        base = f"{self._base_url}/etf/{self.ticker}/"
+        return [
+            f"{base}esg/",
+            f"{base}esg",
+        ]
+
+    def _esg_soup(self) -> bs4.BeautifulSoup:
+        debug_path = getattr(self, "debug_esg_path", None)
+        if self._soup.find(id=re.compile("esg", re.I)) or self._soup.find(
+            class_=re.compile("esg", re.I)
+        ):
+            return self._soup
+        for url in self._prepare_esg_urls():
+            try:
+                text = self._fetch_html(url, debug_path=debug_path)
+            except Exception as exc:
+                logger.debug("failed to fetch esg url %s: %s", url, exc)
+                continue
+            soup = bs4.BeautifulSoup(text, "html.parser")
+            if soup.find(id=re.compile("esg", re.I)) or soup.find(
+                class_=re.compile("esg", re.I)
+            ):
+                return soup
+        logger.warning("esg page not found for %s", self.ticker)
+        return self._soup
+
+    def _parse_esg_blocks(self, soup: bs4.BeautifulSoup) -> Dict:
+        esg_tab = soup.find(id=re.compile(r"esg(_tab)?", re.I)) or soup.find(
+            class_=re.compile("esg", re.I)
+        )
+        if not esg_tab:
+            return {}
+
+        results: Dict[str, Dict] = {}
+
+        score_blocks = esg_tab.select(".general-list .score-block")
+        scores: Dict[str, str] = {}
+        for block in score_blocks:
+            name_el = block.select_one(".score-name")
+            value_el = block.select_one(".score")
+            if not name_el or not value_el:
+                continue
+            name = name_el.get_text(strip=True)
+            value = value_el.get_text(strip=True)
+            if name:
+                scores[name] = value
+        if scores:
+            results["scores"] = scores
+
+        theme_content = esg_tab.select_one(".esg-theme-content") or esg_tab
+        theme_ids = {
+            "environmental-issues": "Environmental",
+            "social-issues": "Social",
+            "governance-issues": "Governance",
+        }
+        themes: Dict[str, Dict[str, Dict[str, str]]] = {}
+        for theme_id, theme_name in theme_ids.items():
+            theme_section = theme_content.find(id=theme_id) if theme_content else None
+            if not theme_section:
+                continue
+            theme_data: Dict[str, Dict[str, str]] = {}
+            for header in theme_section.find_all(
+                "div", class_=re.compile(r"\bclick-show-hide\b")
+            ):
+                title_el = header.find("a")
+                title = title_el.get_text(strip=True) if title_el else ""
+                if not title:
+                    continue
+                detail_list = header.find_next_sibling(
+                    "ul", class_=re.compile(r"\blist-indent\b")
+                )
+                metrics: Dict[str, str] = {}
+                if detail_list:
+                    for item in detail_list.select("div.data-column-esg"):
+                        row = item.select_one(".esg-colum-row")
+                        if not row:
+                            continue
+                        label_el = row.find("span")
+                        value_el = row.select_one(".pull-right span")
+                        label = label_el.get_text(strip=True) if label_el else ""
+                        value = value_el.get_text(strip=True) if value_el else ""
+                        if label:
+                            metrics[label] = value
+                if metrics:
+                    theme_data[title] = metrics
+            if theme_data:
+                themes[theme_name] = theme_data
+
+        if themes:
+            results["themes"] = themes
+
+        return results
+
+    def _esg(self) -> Dict:
+        """Get ESG information for given ETF."""
+        soup = self._esg_soup()
+        results: Dict[str, Dict[str, str]] = {}
+
+        container = soup.find(id=re.compile("esg", re.I)) or soup.find(
+            class_=re.compile("esg", re.I)
+        )
+        tables = []
+        if container:
+            tables = container.find_all("table")
+        else:
+            tables = soup.find_all("table", id=re.compile("esg", re.I))
+
+        for table in tables:
+            table_id = table.get("id")
+            if table_id:
+                data = handle_find_all_rows(table.find_all("tr"))
+                if data:
+                    results[table_id] = data
+
+        if not results:
+            # Fallback: try known table ids directly on the full soup.
+            for table_id in [
+                "esg-table",
+                "esg-ratings-table",
+                "esg-score-table",
+                "esg-scores",
+            ]:
+                if soup.find("table", {"id": table_id}):
+                    data = handle_tbody_thead(soup, table_id)
+                    if data:
+                        results[table_id] = data
+
+        if not results:
+            results = self._parse_esg_blocks(soup)
+
+        return results
+
+    def _description(self) -> str:
+        """Get textual description for given ETF."""
+        soup = self._soup
+        candidates = [
+            soup.find("div", {"id": "full-content"}),
+            soup.find("div", {"id": "etf-description"}),
+            soup.find("div", {"id": "etf-desc"}),
+            soup.find("div", class_="etf-description"),
+            soup.find("div", class_="description"),
+            soup.find("section", {"id": "description"}),
+            soup.find("div", class_="etf-summary"),
+        ]
+        for candidate in candidates:
+            if candidate:
+                text = candidate.get_text(" ", strip=True)
+                if text:
+                    return text
+
+        for heading in soup.find_all(["h2", "h3", "h4"]):
+            title = heading.get_text(" ", strip=True).lower()
+            if "description" in title:
+                block = heading.find_next(["p", "div"])
+                if block:
+                    text = block.get_text(" ", strip=True)
+                    if text:
+                        return text
+        meta_candidates = [
+            soup.find("meta", attrs={"name": "description"}),
+            soup.find("meta", attrs={"property": "og:description"}),
+            soup.find("meta", attrs={"name": "twitter:description"}),
+        ]
+        for meta in meta_candidates:
+            if meta and meta.get("content"):
+                content = meta.get("content", "").strip()
+                if content:
+                    return content
+        return ""
+
     def _basic_info(self) -> Dict:
         """Gets basic information about ETF.
         Like profile information, trading data, valuation, assets etc.
         """
-        etf_ticker_body = self._soup.find("div", {"id": "etf-ticker-body"}).find(
-            "div", class_="row"
-        )
+        ticker_body = self._soup.find("div", {"id": "etf-ticker-body"})
+        if not ticker_body:
+            ticker_body = self._soup.find("div", id=re.compile("etf-ticker", re.I))
         basic_information = {"Symbol": self.ticker, "Url": self.ticker_url}
 
-        for row in etf_ticker_body.find_all("div", class_="row"):
-            key = _handle_nth_child(row, 1)
-            value = row.select_one(":nth-child(2)")
-            try:
-                href = value.find("a")["href"]
-                if href and key != "ETF Home Page":
-                    value_text = (
-                        href
-                        if href.startswith(self._base_url)
-                        else self._base_url + href
-                    )
-                else:
-                    value_text = href
-            except (KeyError, TypeError):
-                value_text = value.text.strip()
+        if not ticker_body:
+            logger.warning("etf ticker body not found for %s", self.ticker)
+        else:
+            etf_ticker_body = ticker_body.find("div", class_="row")
+            if not etf_ticker_body:
+                logger.warning("etf ticker rows not found for %s", self.ticker)
+            else:
+                for row in etf_ticker_body.find_all("div", class_="row"):
+                    key = _handle_nth_child(row, 1)
+                    value = row.select_one(":nth-child(2)")
+                    try:
+                        href = value.find("a")["href"]
+                        if href and key != "ETF Home Page":
+                            value_text = (
+                                href
+                                if href.startswith(self._base_url)
+                                else self._base_url + href
+                            )
+                        else:
+                            value_text = href
+                    except (KeyError, TypeError, AttributeError):
+                        value_text = value.text.strip() if value else ""
 
-            if key == "ETF Home Page" and value_text.startswith(self._base_url):
-                value_text.replace(self._base_url, "")
+                    if key == "ETF Home Page" and value_text.startswith(self._base_url):
+                        value_text.replace(self._base_url, "")
 
-            basic_information.update({key: value_text})
+                    if key:
+                        basic_information.update({key: value_text})
 
         basic_information.update(self._profile_container())
         basic_information.update(self._valuation())

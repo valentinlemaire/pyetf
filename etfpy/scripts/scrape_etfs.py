@@ -4,7 +4,10 @@ import json
 import os
 from pathlib import Path
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
+from etfpy.client.etf_client import ETFDBClient
 from etfpy.client._etfs_scraper import get_all_etfs
 from etfpy.log import get_logger
 
@@ -34,8 +37,32 @@ def all_etfs_json(file_path: str = None) -> None:
     page_size = 250
     logger.info("Scraping all ETFs data from etfdb.com")
 
+    etfs = get_all_etfs(page_size)
+    progress_lock = Lock()
+    completed = 0
+
+    def _fetch_description(etf: dict) -> None:
+        nonlocal completed
+        symbol = etf.get("symbol")
+        if not symbol:
+            etf["description"] = ""
+        else:
+            try:
+                etf["description"] = ETFDBClient(symbol)._description()
+            except Exception:
+                etf["description"] = ""
+        with progress_lock:
+            completed += 1
+            if completed % 50 == 0:
+                logger.info("retrieved descriptions for %s ETFs", completed)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_fetch_description, etf) for etf in etfs]
+        for future in as_completed(futures):
+            future.result()
+
     with open(file_path, "w") as f:
-        json.dump(get_all_etfs(page_size), f)
+        json.dump(etfs, f)
     logger.debug("ETFs data saved to %s", display_path)
 
 

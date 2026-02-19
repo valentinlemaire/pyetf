@@ -3,6 +3,7 @@ from typing import Any, Dict
 import pandas as pd
 import requests
 from requests import HTTPError
+from requests.exceptions import JSONDecodeError
 
 from etfpy.log import get_logger
 from etfpy.utils import get_headers, get_retry_session
@@ -97,6 +98,47 @@ class BaseClient:
             self._api_url, json=request_body, headers=get_headers()
         )
 
+    @staticmethod
+    def _looks_blocked(text: str) -> bool:
+        if not text:
+            return False
+        markers = [
+            "Access Denied",
+            "Pardon Our Interruption",
+            "verify you are human",
+            "captcha",
+            "cloudflare",
+            "distil",
+        ]
+        text_lower = text.lower()
+        return any(marker.lower() in text_lower for marker in markers)
+
+    def _post_request_json(self, request_body: Dict) -> Dict:
+        response = self.post_request(request_body)
+        try:
+            return response.json()
+        except (ValueError, JSONDecodeError):
+            if not self._looks_blocked(response.text):
+                logger.warning("failed to decode ETFDB response JSON")
+            return self._post_request_json_cloudscraper(request_body)
+
+    def _post_request_json_cloudscraper(self, request_body: Dict) -> Dict:
+        try:
+            import cloudscraper  # type: ignore
+        except Exception:
+            return {}
+
+        try:
+            scraper = cloudscraper.create_scraper()
+            scraper.headers.update(get_headers())
+            resp = scraper.post(self._api_url, json=request_body, timeout=30)
+            if resp.status_code != 200:
+                return {}
+            return resp.json()
+        except Exception as exc:
+            logger.warning("cloudscraper post failed: %s", exc)
+            return {}
+
     def get_metadata(self) -> Dict:
         """Gets the metadata for the ETFDB screener API.
 
@@ -107,7 +149,7 @@ class BaseClient:
         """
 
         try:
-            return self.post_request(self._prepare_request_body()).json()
+            return self._post_request_json(self._prepare_request_body())
         except HTTPError as he:
             logger.error(str(he))
         except AttributeError as ae:

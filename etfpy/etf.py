@@ -14,9 +14,9 @@ class ETF(_ETFDBClient):
 
     """
 
-    def __init__(self, ticker: str) -> None:
+    def __init__(self, ticker: str, **kwargs) -> None:
         """Initialize ETF class"""
-        super().__init__(ticker)
+        super().__init__(ticker, **kwargs)
 
     @property
     def info(self) -> dict:
@@ -206,6 +206,11 @@ class ETF(_ETFDBClient):
         return self._volatility()
 
     @property
+    def esg(self) -> dict:
+        """Get ESG information for ETF."""
+        return self._esg()
+
+    @property
     def technicals(self) -> dict:
         """Get ETF technicals information.
 
@@ -248,6 +253,11 @@ class ETF(_ETFDBClient):
          }
         """
         return self._technicals()
+
+    @property
+    def description(self) -> str:
+        """Get textual description for ETF."""
+        return self._description()
 
     @property
     def performance(self) -> dict:

@@ -29,13 +29,14 @@ class ETFListScraper(BaseClient):
 
         """
 
+        url = self._base_url + obj.get("symbol", {}).get("url")
         return {
             "symbol": obj.get("symbol", {}).get("text"),
             "asset_class": obj.get("asset_class"),
             "price": obj.get("price"),
             "average_volume": obj.get("average_volume"),
             "name": obj.get("name", {}).get("text"),
-            "url": self._base_url + obj.get("symbol", {}).get("url"),
+            "url": url,
             "one_year_return": obj.get("ytd"),
         }
 
@@ -84,7 +85,8 @@ class ETFListScraper(BaseClient):
         logger.debug("getting data for page: %s with page_size: %s", page, page_size)
         request_body = self._prepare_request_body(page=page, page_size=page_size)
         try:
-            return self.post_request(request_body).json()["data"]
+            response = self._post_request_json(request_body)
+            return response.get("data", [])
         except (ConnectionError, Timeout) as e:
             logger.error("connection timeout: %s", str(e))
         except (AttributeError, KeyError) as e:
